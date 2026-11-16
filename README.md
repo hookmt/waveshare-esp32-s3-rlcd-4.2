@@ -19,7 +19,7 @@ An optimized, production-grade **Voice Assistant Satellite** and desktop informa
 * **Reflective Display (ST7305):** Ultra-crisp 400x300 monochrome RLCD display readable in ambient daylight with zero backlight glare.
 * **Dual Microphones with Hardware AEC (ES7210):** Superior wake-word listening range and acoustic echo cancellation.
 * **4-Pixel Addressable Status Halo (WS2812):** Downward-firing ambient LED bar displaying real-time smart home and voice states.
-* **Audio Ducking & Media Player MUTE:** Automatically pauses or mutes paired room music streamers (such as **Spider**) when speaking.
+* **Fail-Safe Area Audio Ducking:** Automatically mutes all room media players unconditionally upon wake-word detection until response completion, preventing acoustic feedback.
 * **18650 Battery Backup:** Built-in battery holder with calibrated voltage-to-percentage telemetry on GPIO4.
 * **Custom 3D-Printed Stand & Enclosure:** Functional desktop enclosure with accessible tactile buttons (`KEY`, `PWR`, `BOOT`).
 
@@ -50,7 +50,7 @@ In a Home Assistant deployment, each Voice Assistant Satellite is assigned to a 
 ### How Area-Aware Control Works:
 1. **Contextual Voice Commands:** Saying *"turn on the light"* or *"what is the temperature?"* automatically acts on devices in that specific room, without needing to specify the room name. Global commands (*"turn off all lights in the house"*) remain available.
 2. **Default Room Media Player:** Commands like *"play radio"* automatically target the room's default media player (e.g. WiiM Mini in Studio, Xiaomi speaker in Kitchen, Spider streamer in Bedroom).
-3. **Automatic Room Audio Ducking / MUTE:** While the satellite is actively listening or speaking its reply, Home Assistant automatically mutes or ducks all active media players in that specific room, eliminating acoustic echo and ensuring high wake-word recognition accuracy.
+3. **Fail-Safe Room Audio Ducking / MUTE:** While the satellite is actively listening or speaking its reply, Home Assistant unconditionally mutes all media players assigned to that room (regardless of whether they are playing or idle). By eliminating condition checks, this stateless design is immune to state races or delays and guarantees 100% rock-solid acoustic silence.
 
 > [!TIP]
 > This satellite pairs seamlessly with room touch hubs such as our [waveshare-esp32-s3-touch-lcd-7c](https://github.com/hookmt/waveshare-esp32-s3-touch-lcd-7c).
@@ -153,7 +153,7 @@ Alternatively, write the pre-compiled binary in `firmware/` using `esptool.py` o
   * **Piksel 2 (Drzwi i alarmy):** turkus (otwarte drzwi/okno), miganie (aktywny minutnik lub budzik).
   * **Piksel 3 (Infrastruktura):** zielony (Home Assistant i sieć online), bursztyn (degradacja), czerwony (brak łączności).
 * **Integracja strefowa (Area-Awareness w HA):** satelita przypisany do danego pokoju (np. Studio, Kuchnia, Sypialnia) domyślnie steruje urządzeniami w tym pomieszczeniu ("włącz światło", "jaka jest temperatura") oraz domyślnym odtwarzaczem pokoju ("włącz radio"), z możliwością sterowania całym domem.
-* **Automatyczne wyciszanie strefowe (Audio Ducking / MUTE):** podczas aktywacji asystenta (od wywołania słowa wybudzającego do zakończenia odpowiedzi) Home Assistant automatycznie wycisza wszystkie aktywne odtwarzacze w danym pokoju (np. WiiM Mini, Nest), eliminując zakłócenia akustyczne.
+* **Bezwarunkowe wyciszanie strefowe (Fail-Safe Audio Ducking / MUTE):** podczas aktywacji asystenta (od słowa wybudzenia do końca odpowiedzi) Home Assistant bezwarunkowo wysyła polecenie wyciszenia do wszystkich odtwarzaczy przypisanych do danego pokoju (zarówno grających, jak i aktualnie bezczynnych). Brak warunkowania stanu ("gra / nie gra") upraszcza logikę i gwarantuje 100% niezawodności bez ryzyka wyścigów stanów (race conditions) czy opóźnień.
 * **Ponad 22 godziny pracy na akumulatorze 18650:** zmierzony średni pobór prądu pod obciążeniem to zaledwie ~75-90 mA (~0,35 W). Kalibracja 14-punktowa w ESPHome wiernie odzwierciedla stan rozładowania ogniwa Li-ion aż do progu 2,90 V.
 * **Rozwiązany problem magistrali I2S:** wyeliminowano kolizję pomiędzy kodekiem audio ES8311 a mikrofonem ES7210 poprzez sekwencyjne odczekanie na zakończenie dzwonka wybudzenia przed aktywacją toru nagrywania.
 * **Przyspieszenie SPI do 4 MHz:** transfer bufora 15 KB zajmuje zaledwie ~50 ms zamiast 180 ms, całkowicie likwidując błędy przepełnienia bufora kołowego słowa wybudzającego (`ring buffer`).
