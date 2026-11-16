@@ -1,0 +1,996 @@
+﻿# =============================================================
+# Waveshare ESP32-S3-RLCD-4.2  |  satelita VA + ekran RLCD
+# Zrodlo bazowe: https://devices.esphome.io/devices/waveshare-esp32-s3-rlcd-42/
+# Wersja 4 (2026-07-23): redesign ekranu - zegar "przekladany" w negatywie,
+#   dzien+data obok siebie, temp/wilg z ikonami, WiFi wg sily, status HAOS.
+# Wersja 8 Studio (2026-08-31): piksel 3 respektuje profil jasnosci dzien/noc.
+# Wersja 9 Studio (2026-09-06): zewnetrzny announcement z HA zwalnia wspolne I2S,
+#   a po zakonczeniu bezpiecznie przywraca lokalne wykrywanie wake word.
+# Faza 1: glosnik pokladowy. Faza 2: PCM5102A -> Speaker Enable ALWAYS_OFF.
+# TEST v1, 2026-09-19: po zatrzymaniu MWW odczekaj 200 ms przed przejeciem
+# TEST v2, 2026-09-20: sterowanie przyciskami, piksel 2 = minutnik/budzik,
+#   piksel 3 = stan infrastruktury.
+# Wersja 10 (2026-09-30):
+#   - Naprawa I2S: asynchroniczny bufor dzwonka wybudzenia - sekwencyjny
+#     delay 150ms + podwojny wait_until (speaker + media_player) + 80ms pauzy
+#     przed voice_assistant.start. Czyste I2S bez kolizji i obcinania chime.
+#   - Czcionki: dodano obslugi glifow pauz (em dash \u2014 oraz en dash \u2013)
+#     pod odpowiedzi LLM, usunieto duplikaty znakow.
+#   - Ekran RLCD: przyspieszenie magistrali SPI z 1MHz do 4MHz (4x szybszy transfer
+#     bufora 15KB) oraz update_interval: never (odswiezanie wylacznie zdarzeniowe
+#     co pelna minute oraz przy zdarzeniach HA/VA, likwidacja narzutu CPU).
+#   - Formatowanie LLM: sanityzacja nowej linii (\n, \r -> spacja) w lambdzie tekstu.
+# =============================================================
+
+# ==============================================================================
+# Waveshare ESP32-S3-RLCD-4.2 - Production Voice Assistant Satellite
+# Hardware: Waveshare ESP32-S3-RLCD-4.2 (ST7305 RLCD, ES7210 AEC, ES8311, SHTC3)
+# Status LEDs: 4x WS2812 Addressable RGB Strip (GPIO1)
+# Enclosure: Custom 3D-printed case (enclosure/)
+# Author: hookmt (https://github.com/hookmt)
+# ==============================================================================
+
+substitutions:
+  name: "va-rlcd-01"
+  friendly_name: "Voice Satellite RLCD"
+  room: "living_room"
+  # Home Assistant weather entity (e.g. weather.home, weather.dom, weather.forecast_home)
+  weather_entity: "weather.dom"
+  # Home Assistant status entities (customize to your setup or leave defaults)
+  home_state_entity: "sensor.stan_domu"
+  infrastructure_state_entity: "sensor.stan_infrastruktury"
+  door_state_entity: "sensor.stan_drzwi"
+  timer_entity: "timer.minutnik"
+  timer_room_entity: "input_text.minutnik_pokoj"
+  alarm_entity: "input_datetime.budzik"
+  alarm_room_entity: "input_text.budzik_pokoj"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  on_boot:
+    # Zapal pasek statusowy z efektem animowanym (4 piksele).
+    - light.turn_on:
+        id: status_leds
+        brightness: 100%
+        effect: "Status"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    components:
+      - espressif/esp-nn==1.1.2
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    - lambda: id(wifi_ok) = true;
+    - component.update: my_display
+  on_disconnect:
+    - lambda: id(wifi_ok) = false;
+
+api:
+  # Akcja dla automatyzacji HA. Zmienia tylko mnozniki profilu, nie nastawy
+  # czterech suwakow jasnosci. Dzieki temu dzien/noc, obecnosc i oswietlenie
+  # moga zmieniac profil bez flashowania ani nadpisywania strojenia uzytkownika.
+  actions:
+    - action: set_pixel_profile
+      variables:
+        home_ok_scale: float
+        home_alert_scale: float
+        va_scale: float
+        door_scale: float
+        reserve_scale: float
+      then:
+        - lambda: |-
+            id(pixel_home_ok_scale) = home_ok_scale;
+            id(pixel_home_alert_scale) = home_alert_scale;
+            id(pixel_va_scale) = va_scale;
+            id(pixel_door_scale) = door_scale;
+            id(pixel_reserve_scale) = reserve_scale;
+  on_client_connected:
+    - lambda: id(ha_ok) = true;
+    - component.update: my_display
+  on_client_disconnected:
+    - lambda: id(ha_ok) = false;
+    - component.update: my_display
+
+ota:
+  - platform: esphome
+
+external_components:
+  - source: github://kylehase/ESPHome-ST7305-RLCD
+    components: [st7305_rlcd]
+
+# Czas z Home Assistanta (do zegara na ekranie)
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      # snap minuty o pelnej minucie (jeden tani render, bez animacji)
+      - seconds: 0
+        then:
+          - component.update: my_display
+
+# Znaczniki stanu uzywane przez ekran
+globals:
+  - id: va_state          # 0 czuwa, 1 slucham, 2 mysle, 3 mowie
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: wifi_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ha_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_stt           # co uslyszalo
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: last_reply         # co odpowiedzialo (lub kod bledu)
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: show_reply         # czy pokazywac tekst zamiast zegara
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Mnozniki profilu, ustawiane z HA przez api.set_pixel_profile.
+  # Kazdy jest niezalezny od stalej, recznej jasnosci danego piksela.
+  - id: pixel_home_ok_scale
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+  - id: pixel_home_alert_scale
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+  - id: pixel_va_scale
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+  - id: pixel_door_scale
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+  - id: pixel_reserve_scale
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+
+# ---------- I2C: SHTC3 + ES8311 + ES7210 ----------
+i2c:
+  sda: GPIO13
+  scl: GPIO14
+  scan: true
+  id: bus_a
+
+# ---------- Czcionki ----------
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 18
+    glyphs: " !\"%'()+=,-_.:;?<>*Â°/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÄ„Ä†ÄĹĹĂ“ĹšĹąĹ»Ä…Ä‡Ä™Ĺ‚Ĺ„ĂłĹ›ĹşĹĽâ€”â€“"
+  - file: "gfonts://Roboto"
+    id: font_med
+    size: 30
+    glyphs: " !\"%'()+=,-_.:;?<>*Â°/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÄ„Ä†ÄĹĹĂ“ĹšĹąĹ»Ä…Ä‡Ä™Ĺ‚Ĺ„ĂłĹ›ĹşĹĽ"
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 56
+    glyphs: " !\"%'()+=,-_.:;?<>*Â°/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÄ„Ä†ÄĹĹĂ“ĹšĹąĹ»Ä…Ä‡Ä™Ĺ‚Ĺ„ĂłĹ›ĹşĹĽ"
+  # Duze cyfry zegara "przekladanego"
+  - file: "gfonts://Roboto@700"
+    id: font_clock
+    size: 96
+    glyphs: "0123456789"
+  # Ikony (Material Design Icons): pogoda + termometr/wilgotnosc + wifi + bateria
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icons
+    size: 30
+    glyphs:
+      - "\U000F0590"  # weather-cloudy
+      - "\U000F0591"  # weather-fog
+      - "\U000F0592"  # weather-hail
+      - "\U000F0593"  # weather-lightning
+      - "\U000F0594"  # weather-night
+      - "\U000F0595"  # weather-partly-cloudy
+      - "\U000F0596"  # weather-pouring
+      - "\U000F0597"  # weather-rainy
+      - "\U000F0598"  # weather-snowy
+      - "\U000F0599"  # weather-sunny
+      - "\U000F059D"  # weather-windy
+      - "\U000F067F"  # weather-snowy-rainy
+      - "\U000F0F2F"  # weather-cloudy-alert
+      - "\U000F050F"  # thermometer
+      - "\U000F058E"  # water-percent (wilgotnosc)
+      - "\U000F091F"  # wifi-strength-1
+      - "\U000F0922"  # wifi-strength-2
+      - "\U000F0925"  # wifi-strength-3
+      - "\U000F0928"  # wifi-strength-4
+      - "\U000F05AA"  # wifi-off
+      - "\U000F0079"  # battery
+      - "\U000F0083"  # battery-alert
+      - "\U000F036C"  # microphone
+      - "\U000F036D"  # microphone-off (Mute)
+      - "\U000F0020"  # alarm (budzik)
+      - "\U000F009C"  # bell (minutnik)
+      - "\U000F057E"  # volume-high
+      - "\U000F0581"  # volume-off (Speaker Enable off)
+  # Duza ikona pogody (te same glify co font_icons, wiekszy rozmiar)
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_wicon
+    size: 60
+    glyphs:
+      - "\U000F0590"  # weather-cloudy
+      - "\U000F0591"  # weather-fog
+      - "\U000F0592"  # weather-hail
+      - "\U000F0593"  # weather-lightning
+      - "\U000F0594"  # weather-night
+      - "\U000F0595"  # weather-partly-cloudy
+      - "\U000F0596"  # weather-pouring
+      - "\U000F0597"  # weather-rainy
+      - "\U000F0598"  # weather-snowy
+      - "\U000F0599"  # weather-sunny
+      - "\U000F059D"  # weather-windy
+      - "\U000F067F"  # weather-snowy-rainy
+      - "\U000F0F2F"  # weather-cloudy-alert
+
+# ---------- Ekran ST7305 RLCD ----------
+spi:
+  clk_pin: GPIO11
+  mosi_pin: GPIO12
+
+display:
+  - platform: st7305_rlcd
+    model: WAVESHARE_400X300
+    id: my_display
+    width: 400
+    height: 300
+    cs_pin: GPIO40
+    dc_pin: GPIO5
+    reset_pin: GPIO41
+    data_rate: 4MHz             # Wersja 10: podniesione z 1MHz do 4MHz, 4-krotnie szybszy transfer
+    update_interval: never      # Wersja 10: wylacznie zdarzeniowe (on_time co minute + component.update)
+    lambda: |-
+      it.rectangle(0, 0, 400, 300);
+
+      // ===== PASEK GORNY: WiFi | HAOS | bateria =====
+      const char* wifi_ico = "\U000F05AA";  // wifi-off
+      if (id(wifi_ok)) {
+        float r = id(wifi_rssi).has_state() ? id(wifi_rssi).state : -60.0f;
+        if      (r >= -60) wifi_ico = "\U000F0928";
+        else if (r >= -70) wifi_ico = "\U000F0925";
+        else if (r >= -78) wifi_ico = "\U000F0922";
+        else               wifi_ico = "\U000F091F";
+      }
+      it.printf(6, 4, id(font_icons), "%s", wifi_ico);
+
+      // HAOS: kolko z "H" tuz przy WiFi (2026-07-24, zamiast napisu HAOS BRAK/POLACZONO).
+      //   Polaczone = wypelnione czarne kolko + jasne H; brak = obrys kolka + przekreslenie.
+      //   Stan czytany NA ZYWO z API (is_connected) - odporne na pod/odlaczanie logow ESPHome.
+      {
+        int hx = 58, hy = 18, hr = 11;
+        if (esphome::api::global_api_server->is_connected()) {
+          it.filled_circle(hx, hy, hr);
+          it.printf(hx, hy + 1, id(font_small), COLOR_OFF, TextAlign::CENTER, "H");
+        } else {
+          it.circle(hx, hy, hr);
+          it.printf(hx, hy + 1, id(font_small), COLOR_ON, TextAlign::CENTER, "H");
+          it.line(hx - 9, hy + 9, hx + 9, hy - 9);
+        }
+      }
+
+      // Mikrofon (przekreslony = Mute) + glosnik (przekreslony = wylaczony)
+      // Ikony czasu sa po lewej stronie mikrofonu: minutnik, potem budzik.
+      // Nieaktywna funkcja pozostawia swoje pole puste.
+      const bool timer_here = id(timer_state).state == "active" && id(timer_room).state == "${room}";
+      const bool alarm_here = !id(alarm_time).state.empty() &&
+                              id(alarm_time).state.rfind("1970-01-01", 0) != 0 &&
+                              id(alarm_room).state == "${room}";
+      if (timer_here) it.printf(174, 4, id(font_icons), "%s", "\U000F009C");
+      if (alarm_here) it.printf(212, 4, id(font_icons), "%s", "\U000F0020");
+      it.printf(250, 4, id(font_icons), "%s", id(mute_switch).state ? "\U000F036D" : "\U000F036C");
+      it.printf(288, 4, id(font_icons), "%s", id(spk_enable).state ? "\U000F057E" : "\U000F0581");
+      // Bateria (ikona + %)
+      if (id(bat_level).has_state()) {
+        const char* bico = (id(bat_level).state < 15) ? "\U000F0083" : "\U000F0079";
+        it.printf(326, 4, id(font_icons), "%s", bico);
+        it.printf(394, 11, id(font_small), TextAlign::TOP_RIGHT, "%.0f%%", id(bat_level).state);
+      }
+      it.line(0, 40, 400, 40);
+
+      // ===== SRODEK: rozmowa ALBO zegar przekladany =====
+      if (id(show_reply)) {
+        if (!id(last_stt).empty()) {
+          std::string q = id(last_stt);
+          if (q.size() > 44) {
+            q = q.substr(0, 42);
+            while (!q.empty() && ((unsigned char)q[q.size()-1] & 0xC0) == 0x80) q.erase(q.size()-1);
+            q += "...";
+          }
+          it.printf(8, 50, id(font_small), "> %s", q.c_str());
+        }
+        std::string s = id(last_reply);
+        // Wersja 10: sanityzacja nowej linii i powrotu karetki na spacje dla modeli LLM
+        std::replace(s.begin(), s.end(), '\n', ' ');
+        std::replace(s.begin(), s.end(), '\r', ' ');
+
+        const size_t MAXC = 44;
+        const int    LH   = 26;
+        const int    Y0   = 80;
+        int line = 0;
+        size_t pos = 0;
+        while (pos < s.size() && line < 6) {
+          size_t rem = s.size() - pos;
+          size_t len = (rem < MAXC) ? rem : MAXC;
+          size_t cut = len;
+          if (pos + len < s.size()) {
+            size_t sp = s.rfind(' ', pos + len);
+            if (sp != std::string::npos && sp > pos) {
+              cut = sp - pos;
+            } else {
+              while (cut > 1 && ((unsigned char)s[pos + cut] & 0xC0) == 0x80) cut--;
+            }
+          }
+          it.printf(8, Y0 + line * LH, id(font_small), "%s", s.substr(pos, cut).c_str());
+          pos += cut;
+          while (pos < s.size() && s[pos] == ' ') pos++;
+          line++;
+        }
+      } else {
+        // ---- ZEGAR przekladany (negatyw: czarne klapki, biale cyfry) ----
+        auto t = id(ha_time).now();
+        if (t.is_valid()) {
+          char hh[3], mm[3];
+          snprintf(hh, sizeof(hh), "%02d", t.hour);
+          snprintf(mm, sizeof(mm), "%02d", t.minute);
+          const int CY = 46, CH = 112, CW = 80;
+          auto card = [&](int x, char c) {
+            it.filled_rectangle(x, CY, CW, CH);                        // czarna klapka
+            char b[2] = { c, 0 };
+            it.printf(x + CW / 2, CY + CH / 2, id(font_clock), COLOR_OFF,
+                      TextAlign::CENTER, "%s", b);                     // biala cyfra
+            it.filled_rectangle(x, CY + CH / 2 - 1, CW, 3, COLOR_ON);  // szczelina (przelam cyfry)
+          };
+          card(24,  hh[0]);
+          card(108, hh[1]);
+          it.filled_rectangle(198, CY + 34, 8, 8);                     // dwukropek
+          it.filled_rectangle(198, CY + 70, 8, 8);
+          card(214, mm[0]);
+          card(298, mm[1]);
+
+          // ---- dzien tygodnia + data OBOK SIEBIE ----
+          static const char* dni[] = {"", "niedziela", "poniedziaĹ‚ek", "wtorek",
+                                      "Ĺ›roda", "czwartek", "piÄ…tek", "sobota"};
+          it.printf(24, 166, id(font_med), "%s", dni[t.day_of_week]);
+          it.strftime(376, 166, id(font_med), TextAlign::TOP_RIGHT, "%d.%m.%Y", t);
+        }
+
+        // ---- separator pod data (jak linia nad zegarem) ----
+        it.line(0, 204, 400, 204);
+
+        // ---- pogoda: DUZA ikona + opis obok; temp/wilg w dwoch wierszach po prawej ----
+        std::string wc = id(weather_cond).state;
+        const char* wico = "\U000F0590";
+        const char* wtxt = "Pochmurno";
+        if      (wc == "sunny")        { wico = "\U000F0599"; wtxt = "SĹ‚onecznie"; }
+        else if (wc == "clear-night")  { wico = "\U000F0594"; wtxt = "Bezchmurnie"; }
+        else if (wc == "partlycloudy") { wico = "\U000F0595"; wtxt = "PrzejaĹ›nienia"; }
+        else if (wc == "cloudy")       { wico = "\U000F0590"; wtxt = "Pochmurno"; }
+        else if (wc == "rainy")        { wico = "\U000F0597"; wtxt = "Deszcz"; }
+        else if (wc == "pouring")      { wico = "\U000F0596"; wtxt = "Ulewa"; }
+        else if (wc == "lightning" ||
+                 wc == "lightning-rainy") { wico = "\U000F0593"; wtxt = "Burza"; }
+        else if (wc == "snowy")        { wico = "\U000F0598"; wtxt = "Ĺšnieg"; }
+        else if (wc == "snowy-rainy")  { wico = "\U000F067F"; wtxt = "Deszcz ze Ĺ›niegiem"; }
+        else if (wc == "fog")          { wico = "\U000F0591"; wtxt = "MgĹ‚a"; }
+        else if (wc == "hail")         { wico = "\U000F0592"; wtxt = "Grad"; }
+        else if (wc == "windy" ||
+                 wc == "windy-variant"){ wico = "\U000F059D"; wtxt = "Wietrznie"; }
+        else if (wc == "exceptional")  { wico = "\U000F0F2F"; wtxt = "Uwaga"; }
+        it.printf(14, 212, id(font_wicon), "%s", wico);                        // duza ikona pogody
+        // opis obok ikony: do DWOCH wierszy (dziel na spacji gdy dlugi), inaczej jeden wysrodkowany
+        {
+          std::string wt = wtxt;
+          size_t sp = wt.find(' ');
+          if (wt.size() > 11 && sp != std::string::npos) {
+            it.printf(86, 216, id(font_med), "%s", wt.substr(0, sp).c_str());
+            it.printf(86, 248, id(font_med), "%s", wt.substr(sp + 1).c_str());
+          } else {
+            it.printf(86, 242, id(font_med), TextAlign::CENTER_LEFT, "%s", wt.c_str());
+          }
+        }
+
+        // ---- temp (gorny wiersz) + wilgotnosc (dolny) po PRAWEJ, na wysokosci ikony ----
+        if (id(weather_temp).has_state()) {
+          it.printf(282, 214, id(font_icons), "\U000F050F");                   // termometr
+          it.printf(320, 216, id(font_med), "%.0fÂ°", id(weather_temp).state);
+        }
+        if (id(weather_hum).has_state()) {
+          it.printf(282, 248, id(font_icons), "\U000F058E");                   // wilgotnosc
+          it.printf(320, 250, id(font_med), "%.0f%%", id(weather_hum).state);
+        }
+      }
+
+# ---------- Audio: I2S + kodek + ADC mikrofonow ----------
+i2s_audio:
+  - id: i2s_shared
+    i2s_lrclk_pin: GPIO45
+    i2s_bclk_pin: GPIO9
+    i2s_mclk_pin: GPIO16
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+audio_adc:
+  - platform: es7210
+    id: es7210_adc
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    mic_gain: 24dB
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    i2s_audio_id: i2s_shared
+    i2s_dout_pin: GPIO8
+    dac_type: external
+    audio_dac: es8311_dac
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    buffer_duration: 100ms
+    timeout: never
+
+  - platform: resampler
+    id: announcement_speaker
+    output_speaker: i2s_audio_speaker
+
+microphone:
+  - platform: i2s_audio
+    id: va_mic
+    i2s_audio_id: i2s_shared
+    i2s_din_pin: GPIO10
+    adc_type: external
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    pdm: false
+
+media_player:
+  - platform: speaker
+    id: speaker_media_player
+    name: None
+    announcement_pipeline:
+      speaker: announcement_speaker
+      format: FLAC
+      sample_rate: 16000
+      num_channels: 1
+    # Zewnetrzny TTS z HA omija voice_assistant.on_tts_start. Trzeba wiec
+    # zwolnic mikrofon tutaj, zanim announcement przejmie wspolna magistrale I2S.
+    on_announcement:
+      - script.stop: restart_mww
+      - micro_wake_word.stop:
+      - delay: 200ms
+    on_idle:
+      - script.execute: restart_mww
+    files:
+      - id: wake_word_triggered_sound
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+
+# ---------- Wake word lokalnie + pipeline VA ----------
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: va_mic
+    channels: 0
+    gain_factor: 4
+  vad:
+  models:
+    # 2026-07-27: DWA sloty wake word. W HA: "Alexa" -> pipeline DeepSeek (chmura),
+    # "Okay Nabu" -> pipeline "Polski HAOS" (lokalny, dziala bez internetu).
+    # Drugi model = wiecej pracy CPU; jesli wroca ostrzezenia
+    # "micro_wake_word: Not enough free bytes in ring buffer" -> usunac okay_nabu.
+    - model: alexa
+      id: wake_model_alexa
+    - model: okay_nabu
+      id: wake_model_okay_nabu
+  on_wake_word_detected:
+    # 1. Rozpocznij odtwarzanie dzwonka wybudzenia:
+    - media_player.speaker.play_on_device_media_file:
+        media_file: wake_word_triggered_sound
+        announcement: true
+    # 2. Daj pipeline 150 ms na przejscie do faktycznego odtwarzania w tle:
+    - delay: 150ms
+    # 3. Poczekaj az dzwonek wybrzmi do konca i zwolni glosnik oraz I2S:
+    - wait_until:
+        not:
+          speaker.is_playing:
+            id: i2s_audio_speaker
+    - wait_until:
+        not:
+          media_player.is_announcing: speaker_media_player
+    # 4. Krotka pauza stabilizujaca kodek przed startem mikrofonu:
+    - delay: 80ms
+    # 5. Dopiero teraz startujemy zbieranie audio z mikrofonu:
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone:
+    microphone: va_mic
+    channels: 0
+    gain_factor: 4
+  media_player: speaker_media_player
+  micro_wake_word: mww
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  on_listening:
+    - lambda: |-
+        id(va_state) = 1;
+        id(show_reply) = false;
+        id(last_stt) = "";
+        id(last_reply) = "";
+    - component.update: my_display
+  on_stt_vad_end:
+    - lambda: id(va_state) = 2;
+    - component.update: my_display
+  on_stt_end:
+    - lambda: |-
+        id(last_stt) = x;
+        id(show_reply) = true;
+    - script.execute: text_timeout
+    - component.update: my_display
+  on_tts_start:
+    - micro_wake_word.stop:
+    - delay: 200ms
+    - lambda: |-
+        id(va_state) = 3;
+        id(last_reply) = x;
+        id(show_reply) = true;
+    - script.execute: text_timeout
+    - component.update: my_display
+  on_error:
+    - lambda: |-
+        id(last_reply) = std::string("BLAD ") + code + ": " + message;
+        id(show_reply) = true;
+    - script.execute: text_timeout
+    - component.update: my_display
+    - script.execute: restart_mww
+  on_end:
+    - script.execute: restart_mww
+  on_client_connected:
+    - micro_wake_word.start:
+  on_client_disconnected:
+    - micro_wake_word.stop:
+
+script:
+  - id: restart_mww
+    mode: restart
+    then:
+      - delay: 500ms
+      - wait_until:
+          not:
+            media_player.is_announcing:
+      - wait_until:
+          not:
+            speaker.is_playing:
+              id: i2s_audio_speaker
+      - if:
+          condition:
+            and:
+              - not:
+                  voice_assistant.is_running:
+              - switch.is_on: use_wake_word_switch
+              - not:
+                  switch.is_on: mute_switch
+          then:
+            - lambda: id(va_state) = 0;
+            - component.update: my_display
+            - delay: 200ms
+            - micro_wake_word.start:
+
+  # po 22 s tekst znika i wraca zegar (kazdy nowy tekst resetuje odliczanie)
+  - id: text_timeout
+    mode: restart
+    then:
+      - delay: 22s
+      - lambda: id(show_reply) = false;
+      - component.update: my_display
+
+  # PRZERWANIE: zatrzymuje sluchanie / mielenie / mowienie i wraca do CZUWA
+  - id: abort_va
+    mode: restart
+    then:
+      - script.stop: restart_mww
+      - voice_assistant.stop:
+      - media_player.stop:
+          id: speaker_media_player
+      - lambda: |-
+          id(va_state) = 0;
+          id(show_reply) = false;
+          id(last_stt) = "";
+          id(last_reply) = "";
+      - script.stop: text_timeout
+      - component.update: my_display
+      - delay: 300ms
+      - if:
+          condition:
+            and:
+              - switch.is_on: use_wake_word_switch
+              - not:
+                  switch.is_on: mute_switch
+          then:
+            - micro_wake_word.start:
+
+# ---------- Przelaczniki ----------
+switch:
+  - platform: gpio
+    name: "Speaker Enable"
+    id: spk_enable
+    pin: GPIO46
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Mute"
+    id: mute_switch
+    icon: mdi:microphone-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - micro_wake_word.stop:
+      - voice_assistant.stop:
+      - component.update: my_display
+    on_turn_off:
+      - component.update: my_display
+      - if:
+          condition:
+            switch.is_on: use_wake_word_switch
+          then:
+            - micro_wake_word.start:
+
+  - platform: template
+    name: "Use Wake Word"
+    id: use_wake_word_switch
+    icon: mdi:chat-processing
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            not:
+              switch.is_on: mute_switch
+          then:
+            - micro_wake_word.start:
+    on_turn_off:
+      - micro_wake_word.stop:
+
+# ---------- Przyciski ----------
+binary_sensor:
+  - platform: gpio
+    name: "Boot Button"
+    pin:
+      number: GPIO0
+      inverted: true
+      mode: INPUT
+    on_click:
+      # Tak samo jak GPIO18: krotko = PRZERWIJ, dlugo = MUTE.
+      - min_length: 30ms
+        max_length: 700ms
+        then:
+          - script.execute: abort_va
+      - min_length: 701ms
+        max_length: 4000ms
+        then:
+          - switch.toggle: mute_switch
+
+  - platform: gpio
+    name: "Key Button"
+    pin:
+      number: GPIO18
+      inverted: true
+      mode: INPUT
+    on_click:
+      # GPIO0 i GPIO18 maja identyczna obsluge: krotko = PRZERWIJ.
+      - min_length: 30ms
+        max_length: 700ms
+        then:
+          - script.execute: abort_va
+      # dlugie przytrzymanie po puszczeniu = wlacz/wylacz MUTE mikrofonu
+      - min_length: 701ms
+        max_length: 4000ms
+        then:
+          - switch.toggle: mute_switch
+
+# ---------- Przerwanie takze z HA ----------
+button:
+  - platform: template
+    name: "Przerwij"
+    icon: mdi:stop-circle-outline
+    on_press:
+      - script.execute: abort_va
+
+# ---------- Glosnosc TTS, jasnosc pikseli + czulosc wybudzania ----------
+number:
+  - platform: template
+    name: "TTS Volume"
+    id: tts_volume
+    icon: mdi:volume-high
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 75
+    optimistic: true
+    restore_value: true
+    set_action:
+      then:
+        - media_player.volume_set:
+            id: speaker_media_player
+            volume: !lambda "return x / 100.0;"
+
+  - platform: template
+    name: "JasnoĹ›Ä‡ LED 1: stan domu"
+    id: pixel_home_brightness
+    icon: mdi:home-heart
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "JasnoĹ›Ä‡ LED 2: stan VA"
+    id: pixel_va_brightness
+    icon: mdi:account-voice
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "JasnoĹ›Ä‡ LED 3: stan drzwi"
+    id: pixel_door_brightness
+    icon: mdi:door-open
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "JasnoĹ›Ä‡ LED 4: stan infrastruktury"
+    id: pixel_reserve_brightness
+    icon: mdi:led-outline
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "CzuĹ‚oĹ›Ä‡ wybudzania Alexa"
+    id: wake_sensitivity_alexa
+    icon: mdi:ear-hearing
+    entity_category: config
+    mode: slider
+    min_value: 1
+    max_value: 15
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            const float cutoff = 1.0f - (x * 0.01f);
+            id(wake_model_alexa).set_probability_cutoff(
+              static_cast<uint8_t>((cutoff * 255.0f) + 0.5f)
+            );
+
+  - platform: template
+    name: "CzuĹ‚oĹ›Ä‡ wybudzania Okay Nabu"
+    id: wake_sensitivity_okay_nabu
+    icon: mdi:ear-hearing
+    entity_category: config
+    mode: slider
+    min_value: 1
+    max_value: 15
+    step: 1
+    initial_value: 3
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            const float cutoff = 1.0f - (x * 0.01f);
+            id(wake_model_okay_nabu).set_probability_cutoff(
+              static_cast<uint8_t>((cutoff * 255.0f) + 0.5f)
+            );
+
+# ---------- Czujniki ----------
+sensor:
+  - platform: adc
+    id: bat_voltage
+    name: "Battery Voltage"
+    pin: GPIO4
+    attenuation: 12db
+    update_interval: 60s
+    filters:
+      - multiply: 3.0
+
+  - platform: copy
+    source_id: bat_voltage
+    id: bat_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    filters:
+      - calibrate_linear:
+          method: exact
+          datapoints:
+            - 2.90 -> 0.0
+            - 3.00 -> 1.0
+            - 3.10 -> 4.0
+            - 3.20 -> 7.0
+            - 3.30 -> 11.0
+            - 3.40 -> 17.0
+            - 3.50 -> 25.0
+            - 3.60 -> 35.0
+            - 3.70 -> 47.0
+            - 3.80 -> 60.0
+            - 3.90 -> 73.0
+            - 4.00 -> 85.0
+            - 4.10 -> 94.0
+            - 4.20 -> 100.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: 30s
+
+  - platform: homeassistant
+    id: weather_temp
+    entity_id: ${weather_entity}
+    attribute: temperature
+  - platform: homeassistant
+    id: weather_hum
+    entity_id: ${weather_entity}
+    attribute: humidity
+
+# ---------- Dane z HA (piksel statusowy + pogoda na ekranie) ----------
+text_sensor:
+  - platform: homeassistant
+    id: home_state
+    entity_id: ${home_state_entity}
+  - platform: homeassistant
+    id: infrastructure_state
+    entity_id: ${infrastructure_state_entity}
+  - platform: homeassistant
+    id: door_state
+    entity_id: ${door_state_entity}
+  - platform: homeassistant
+    id: timer_state
+    entity_id: ${timer_entity}
+    on_value:
+      then:
+        - component.update: my_display
+  - platform: homeassistant
+    id: timer_room
+    entity_id: ${timer_room_entity}
+    on_value:
+      then:
+        - component.update: my_display
+  - platform: homeassistant
+    id: alarm_time
+    entity_id: ${alarm_entity}
+    on_value:
+      then:
+        - component.update: my_display
+  - platform: homeassistant
+    id: alarm_room
+    entity_id: ${alarm_room_entity}
+    on_value:
+      then:
+        - component.update: my_display
+  - platform: homeassistant
+    id: weather_cond
+    entity_id: ${weather_entity}
+
+# ---------- Piksele statusowe WS2812 ----------
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_leds
+    name: "Status LED"
+    internal: true
+    pin: GPIO1
+    num_leds: 4
+    channel_colors: GRB
+    chipset: WS2812
+    default_transition_length: 0s
+    restore_mode: ALWAYS_ON
+    effects:
+      - addressable_lambda:
+          name: "Status"
+          update_interval: 40ms
+          lambda: |-
+            float tsec = millis() / 1000.0f;
+            float home_brightness = id(pixel_home_brightness).state / 100.0f;
+            float va_brightness = id(pixel_va_brightness).state / 100.0f;
+            float door_brightness = id(pixel_door_brightness).state / 100.0f;
+            float reserve_brightness = id(pixel_reserve_brightness).state / 100.0f;
+            float reserve_profile_brightness = reserve_brightness * id(pixel_reserve_scale);
+
+            // ---- Piksel 0: STAN DOMU ----
+            std::string hs = id(home_state).state;
+            if (hs == "OK") {
+              float b = (0.12f + 0.33f * (0.5f + 0.5f * sinf(tsec * 1.6f))) * home_brightness * id(pixel_home_ok_scale);
+              it[0] = Color(0, (uint8_t)(255 * b), 0);
+            } else if (hs == "UWAGA") {
+              float b = ((sinf(tsec * 4.5f) > 0.0f) ? 0.65f : 0.05f) * home_brightness * id(pixel_home_alert_scale);
+              it[0] = Color((uint8_t)(255 * b), (uint8_t)(110 * b), 0);
+            } else if (hs == "BLAD" || hs == "KRYTYCZNE") {
+              it[0] = Color((uint8_t)(180 * home_brightness * id(pixel_home_alert_scale)), 0, 0);
+            } else {
+              it[0] = Color(0, 0, 0);
+            }
+
+            // ---- Piksel 1: STAN VA ----
+            switch (id(va_state)) {
+              case 1: it[1] = Color(0, (uint8_t)(40 * va_brightness * id(pixel_va_scale)), (uint8_t)(255 * va_brightness * id(pixel_va_scale)));  break;
+              case 2: it[1] = Color((uint8_t)(255 * va_brightness * id(pixel_va_scale)), (uint8_t)(120 * va_brightness * id(pixel_va_scale)), 0); break;
+              case 3: it[1] = Color(0, (uint8_t)(200 * va_brightness * id(pixel_va_scale)), (uint8_t)(60 * va_brightness * id(pixel_va_scale)));  break;
+              default: it[1] = Color(0, 0, 0);
+            }
+
+            // ---- Piksel 2: STAN DRZWI ----
+            std::string ds = id(door_state).state;
+            if (ds == "Wszystkie drzwi zamkniete" || ds.empty()) {
+              it[2] = Color(0, 0, 0);
+            } else {
+              it[2] = Color(0, (uint8_t)(150 * door_brightness * id(pixel_door_scale)), (uint8_t)(150 * door_brightness * id(pixel_door_scale)));
+            }
+
+            // ---- Piksel 3: STAN INFRASTRUKTURY ----
+            std::string ins = id(infrastructure_state).state;
+            if (ins == "OK") {
+              float b = (0.12f + 0.33f * (0.5f + 0.5f * sinf(tsec * 1.6f))) * reserve_profile_brightness;
+              it[3] = Color(0, (uint8_t)(255 * b), 0);
+            } else if (ins == "UWAGA") {
+              float b = ((sinf(tsec * 4.5f) > 0.0f) ? 0.65f : 0.05f) * reserve_profile_brightness;
+              it[3] = Color((uint8_t)(255 * b), (uint8_t)(110 * b), 0);
+            } else if (ins == "BLAD" || ins == "KRYTYCZNE") {
+              it[3] = Color((uint8_t)(180 * reserve_profile_brightness), 0, 0);
+            } else {
+              it[3] = Color((uint8_t)(180 * reserve_profile_brightness), (uint8_t)(90 * reserve_profile_brightness), 0);
+            }
