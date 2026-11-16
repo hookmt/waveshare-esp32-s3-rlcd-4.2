@@ -25,28 +25,35 @@ An optimized, production-grade **Voice Assistant Satellite** and desktop informa
 
 ---
 
-## System Ecosystem
+## Area-Aware System Architecture
 
-This project is part of a coordinated hardware trio for Home Assistant:
+In a Home Assistant deployment, each Voice Assistant Satellite is assigned to a specific **Area** (e.g. Studio, Kitchen, Bedroom, Living Room), enabling natural, room-aware smart home control:
 
 ```text
-       +----------------------------------------------------+
-       |              Home Assistant Server                 |
-       +----------------------------------------------------+
-              ^                         ^            ^
-              |                         |            |
-       [Assist Pipeline]           [Dashboard]  [Music Assistant]
-              |                         |            |
-              v                         v            v
-     +-----------------+       +----------------+   +-------------------+
-     |   RLCD 4.2"     | <---> |  Touch LCD 7C  |   |  Spider Streamer  |
-     | Voice Satellite |  MUTE |  Touch Control |-->|  ESP32-S3 + DAC   |
-     +-----------------+       +----------------+   +-------------------+
+                        +------------------------------------+
+                        |       Home Assistant Server        |
+                        |   Voice Pipeline : Area Context    |
+                        +------------------------------------+
+                                   ^              |
+               Wi-Fi ESPHome Native|              | Area Audio Ducking / MUTE
+               Wake-word & Speech  |              | during conversation
+                                   v              v
+      +----------------------------------+   +-------------------------------+
+      |   Waveshare ESP32-S3-RLCD-4.2    |   |     Room Media Player(s)      |
+      |   Area Voice Satellite           |   |   (e.g., WiiM Mini / Nest /   |
+      |   - Flip-clock & Weather display |   |    Spider via Music Assistant)|
+      |   - 4-Pixel WS2812 status halo   |   +-------------------------------+
+      |   - Contextual room & home Ctrl  |
+      +----------------------------------+
 ```
 
-1. **RLCD 4.2" (This Repository):** Whisper-quiet, ambient bedside or desk voice satellite with flip-clock and weather display.
-2. **Touch LCD 7C:** 7-inch central wall or bedside control hub for lights, scenes, and media (see [waveshare-esp32-s3-touch-lcd-7c](https://github.com/hookmt/waveshare-esp32-s3-touch-lcd-7c)).
-3. **Spider Audio Receiver:** Dedicated Hi-Fi network audio streamer (ESP32-S3 + PCM5102A DAC) controlled via Music Assistant. When the RLCD detects speech, room music automatically ducks or mutes.
+### How Area-Aware Control Works:
+1. **Contextual Voice Commands:** Saying *"turn on the light"* or *"what is the temperature?"* automatically acts on devices in that specific room, without needing to specify the room name. Global commands (*"turn off all lights in the house"*) remain available.
+2. **Default Room Media Player:** Commands like *"play radio"* automatically target the room's default media player (e.g. WiiM Mini in Studio, Xiaomi speaker in Kitchen, Spider streamer in Bedroom).
+3. **Automatic Room Audio Ducking / MUTE:** While the satellite is actively listening or speaking its reply, Home Assistant automatically mutes or ducks all active media players in that specific room, eliminating acoustic echo and ensuring high wake-word recognition accuracy.
+
+> [!TIP]
+> This satellite pairs seamlessly with room touch hubs such as our [waveshare-esp32-s3-touch-lcd-7c](https://github.com/hookmt/waveshare-esp32-s3-touch-lcd-7c).
 
 ---
 
@@ -145,7 +152,8 @@ Alternatively, write the pre-compiled binary in `firmware/` using `esptool.py` o
   * **Piksel 1 (Asystent VA):** niebieski (nasłuch), bursztyn (przetwarzanie zapytania), zielony (odpowiedź głosowa).
   * **Piksel 2 (Drzwi i alarmy):** turkus (otwarte drzwi/okno), miganie (aktywny minutnik lub budzik).
   * **Piksel 3 (Infrastruktura):** zielony (Home Assistant i sieć online), bursztyn (degradacja), czerwony (brak łączności).
-* **Koordynacja z odtwarzaczami (MUTE / Audio Ducking):** podczas wykrycia mowy satelita automatycznie wycisza skojarzony w danym pokoju odtwarzacz muzyczny (**Spider** / Music Assistant).
+* **Integracja strefowa (Area-Awareness w HA):** satelita przypisany do danego pokoju (np. Studio, Kuchnia, Sypialnia) domyślnie steruje urządzeniami w tym pomieszczeniu ("włącz światło", "jaka jest temperatura") oraz domyślnym odtwarzaczem pokoju ("włącz radio"), z możliwością sterowania całym domem.
+* **Automatyczne wyciszanie strefowe (Audio Ducking / MUTE):** podczas aktywacji asystenta (od wywołania słowa wybudzającego do zakończenia odpowiedzi) Home Assistant automatycznie wycisza wszystkie aktywne odtwarzacze w danym pokoju (np. WiiM Mini, Nest), eliminując zakłócenia akustyczne.
 * **Ponad 22 godziny pracy na akumulatorze 18650:** zmierzony średni pobór prądu pod obciążeniem to zaledwie ~75-90 mA (~0,35 W). Kalibracja 14-punktowa w ESPHome wiernie odzwierciedla stan rozładowania ogniwa Li-ion aż do progu 2,90 V.
 * **Rozwiązany problem magistrali I2S:** wyeliminowano kolizję pomiędzy kodekiem audio ES8311 a mikrofonem ES7210 poprzez sekwencyjne odczekanie na zakończenie dzwonka wybudzenia przed aktywacją toru nagrywania.
 * **Przyspieszenie SPI do 4 MHz:** transfer bufora 15 KB zajmuje zaledwie ~50 ms zamiast 180 ms, całkowicie likwidując błędy przepełnienia bufora kołowego słowa wybudzającego (`ring buffer`).
