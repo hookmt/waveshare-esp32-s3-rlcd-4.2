@@ -1,4 +1,4 @@
-# Waveshare ESP32-S3-RLCD-4.2 · Voice Assistant Satellite
+# Waveshare ESP32-S3-RLCD-4.2 - Voice Assistant Satellite
 
 [![ESPHome](https://img.shields.io/badge/ESPHome-2026.10.2-blue.svg)](https://esphome.io)
 [![Hardware](https://img.shields.io/badge/Board-Waveshare%20ESP32--S3--RLCD--4.2-orange.svg)](https://www.waveshare.com)
@@ -9,7 +9,7 @@ An optimized, production-grade **Voice Assistant Satellite** and desktop informa
 ![Waveshare ESP32-S3-RLCD-4.2 Assembled](hardware/10_assembled_hero_front.jpg)
 
 > [!NOTE]
-> **Video Demonstration:** A 4.5-minute real-world video demo showcasing wake-word detection, conversational context, and LLM dialogue handling is available in `hardware/rlcd_voice_demo.mp4` (or embedded below).
+> **Video Demonstration:** A 4.5-minute real-world video demo showcasing wake-word detection, conversational context, and LLM dialogue handling is available in [GitHub Release v1.0.0](https://github.com/hookmt/waveshare-esp32-s3-rlcd-4.2/releases/tag/v1.0.0) or direct download: [rlcd_voice_demo.mp4](https://github.com/hookmt/waveshare-esp32-s3-rlcd-4.2/releases/download/v1.0.0/rlcd_voice_demo.mp4).
 
 
 ---
@@ -45,7 +45,7 @@ This project is part of a coordinated hardware trio for Home Assistant:
 ```
 
 1. **RLCD 4.2" (This Repository):** Whisper-quiet, ambient bedside or desk voice satellite with flip-clock and weather display.
-2. **Touch LCD 7C:** 7-inch central wall or bedside control hub for lights, scenes, and media.
+2. **Touch LCD 7C:** 7-inch central wall or bedside control hub for lights, scenes, and media (see [waveshare-esp32-s3-touch-lcd-7c](https://github.com/hookmt/waveshare-esp32-s3-touch-lcd-7c)).
 3. **Spider Audio Receiver:** Dedicated Hi-Fi network audio streamer (ESP32-S3 + PCM5102A DAC) controlled via Music Assistant. When the RLCD detects speech, room music automatically ducks or mutes.
 
 ---
