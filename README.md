@@ -6,10 +6,11 @@
 
 An optimized, production-grade **Voice Assistant Satellite** and desktop information hub for **Home Assistant**, built on the **Waveshare ESP32-S3-RLCD-4.2** development board.
 
-![Waveshare ESP32-S3-RLCD-4.2 Assembled](hardware/08_assembled_device_front.jpg)
+![Waveshare ESP32-S3-RLCD-4.2 Assembled](hardware/10_assembled_hero_front.jpg)
 
 > [!NOTE]
-> **Video Demonstration:** A live video demo showcasing wake-word detection, LLM dialogue, and media player ducking will be published here upon final field recording.
+> **Video Demonstration:** A 4.5-minute real-world video demo showcasing wake-word detection, conversational context, and LLM dialogue handling is available in `hardware/rlcd_voice_demo.mp4` (or embedded below).
+
 
 ---
 

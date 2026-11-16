@@ -82,7 +82,14 @@ Insert the crimped jumper pins into the 2x8 header:
 - Green wire to `GP1` (fourth pin on left)
 ![Header Wiring Detail](07_header_wiring_detail.jpg)
 
-### Step 8: Final Assembly & Live Run
-Assemble into the 3D-printed enclosure. The status LEDs illuminate downwards/backwards with an elegant halo reflection.
-![Assembled Device Front](08_assembled_device_front.jpg)
-![Assembled Device Side](09_assembled_device_side.jpg)
+### Step 8: Battery Installation & Internal Wiring
+Install the 18650 cell into the integrated holder. Secure the header wires neatly.
+![Battery and Internal Wiring](14_battery_and_wiring_internal.jpg)
+
+### Step 9: Final Assembly & Live Run
+Assemble into the 3D-printed enclosure. The status LEDs illuminate downwards through the dedicated rear slot with an elegant halo reflection on the desk surface.
+![Assembled Device Hero](10_assembled_hero_front.jpg)
+![Assembled Angle View](11_assembled_angle_view.jpg)
+![Rear LED Halo Slot](13_rear_led_halo_slot.jpg)
+![Top Speaker Grille](12_top_speaker_grille.jpg)
+
