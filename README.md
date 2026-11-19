@@ -116,8 +116,6 @@ At the default 1 MHz SPI bus speed, transferring the 15 KB display buffer took o
 │   ├── front_rlcd_modified.blend        # Blender editable source file
 │   ├── back_rlcd.step                   # Rear enclosure snap cover
 │   └── buttons_rlcd.step                # Tactile push-button caps
-├── firmware/
-│   └── esp32_s3_rlcd_42_factory.bin     # Pre-compiled flashable factory binary
 └── README.md
 ```
 
@@ -137,8 +135,6 @@ Connect the board via USB-C and compile:
 ```bash
 esphome run esphome/esp32_s3_rlcd_42_satellite.yaml
 ```
-
-Alternatively, write the pre-compiled binary in `firmware/` using `esptool.py` or the web browser ESP Web Tools flasher.
 
 ---
 
